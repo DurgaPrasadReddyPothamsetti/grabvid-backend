@@ -7,248 +7,172 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ── MIDDLEWARE ──
-app.use(cors({
-  origin: '*', // In production set to your frontend domain
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type']
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 app.use(express.json());
 
-// ── HELPERS ──
-function sanitizeUrl(url) {
-  try {
-    const u = new URL(url);
-    const allowed = ['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com'];
-    if (!allowed.includes(u.hostname)) return null;
-    return url;
-  } catch {
-    return null;
+// ── FIND YT-DLP ──
+function getYtDlpPath() {
+  const candidates = [
+    process.env.YTDLP_PATH,
+    '/home/render/.local/bin/yt-dlp',
+    '/opt/render/.local/bin/yt-dlp',
+    path.join(process.env.HOME || '', '.local/bin/yt-dlp'),
+    '/usr/local/bin/yt-dlp',
+    '/usr/bin/yt-dlp',
+    './yt-dlp',
+    'yt-dlp'
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try { if (p === 'yt-dlp' || fs.existsSync(p)) return p; } catch {}
   }
+  return 'yt-dlp';
 }
 
-function runYtDlp(args) {
+function runCmd(cmd) {
   return new Promise((resolve, reject) => {
-    // Try multiple paths — ./yt-dlp for Render, yt-dlp for local/global install
-    const ytdlpPath = process.env.YTDLP_PATH ||
-      (fs.existsSync(path.join(__dirname, 'yt-dlp')) ? path.join(__dirname, 'yt-dlp') : 'yt-dlp');
-    const cmd = `${ytdlpPath} ${args}`;
-
-    exec(cmd, { timeout: 30000, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr || err.message));
-        return;
-      }
+    console.log('CMD:', cmd.substring(0, 120));
+    exec(cmd, {
+      timeout: 60000,
+      maxBuffer: 1024 * 1024 * 10,
+      env: { ...process.env, HOME: process.env.HOME || '/tmp' }
+    }, (err, stdout, stderr) => {
+      if (err) { console.error('ERR:', stderr || err.message); reject(new Error(stderr || err.message)); return; }
       resolve(stdout.trim());
     });
   });
 }
 
-function formatNumber(n) {
+function runYtDlp(args) {
+  const p = getYtDlpPath();
+  return runCmd(`"${p}" ${args}`);
+}
+
+function fmtNum(n) {
   if (!n) return null;
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  if (n >= 1e9) return (n/1e9).toFixed(1)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
   return String(n);
 }
 
-function formatDuration(seconds) {
-  if (!seconds) return null;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  if (h > 0) return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
-  return `${m}:${String(s).padStart(2,'0')}`;
+function fmtDur(s) {
+  if (!s) return null;
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60;
+  if (h>0) return h+':'+String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0');
+  return m+':'+String(ss).padStart(2,'0');
+}
+
+function checkUrl(url) {
+  try {
+    const u = new URL(url);
+    return ['youtube.com','www.youtube.com','youtu.be','m.youtube.com'].includes(u.hostname) ? url : null;
+  } catch { return null; }
 }
 
 // ── ROUTES ──
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'GrabVid API', version: '1.0.0' }));
 
-// Health check
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'GrabVid API', version: '1.0.0' });
+// Debug endpoint — visit /debug to see yt-dlp path and version
+app.get('/debug', async (req, res) => {
+  const ytPath = getYtDlpPath();
+  let version = 'unknown', which = 'unknown';
+  try { version = await runYtDlp('--version'); } catch(e) { version = 'ERROR: '+e.message; }
+  try { which = await runCmd('which yt-dlp 2>/dev/null || echo "not in PATH"'); } catch(e) { which = e.message; }
+  // Find all yt-dlp binaries
+  let findResult = '';
+  try { findResult = await runCmd('find /home /opt /usr -name "yt-dlp" 2>/dev/null | head -10'); } catch {}
+  res.json({ ytPath, version, which, findResult, HOME: process.env.HOME, PATH: process.env.PATH?.substring(0,300) });
 });
 
-// GET /info?url=... — returns video metadata + available formats
+// GET /info?url=...
 app.get('/info', async (req, res) => {
   const { url } = req.query;
-
-  if (!url) {
-    return res.status(400).json({ error: 'URL parameter is required' });
-  }
-
-  const safeUrl = sanitizeUrl(url);
-  if (!safeUrl) {
-    return res.status(400).json({ error: 'Invalid or unsupported URL. Only YouTube URLs are supported.' });
-  }
+  if (!url) return res.status(400).json({ error: 'URL required' });
+  const safe = checkUrl(url);
+  if (!safe) return res.status(400).json({ error: 'Only YouTube URLs supported.' });
 
   try {
-    // Get video info as JSON
-    const output = await runYtDlp(
-      `--dump-json --no-playlist --no-warnings "${safeUrl}"`
-    );
-
-    const data = JSON.parse(output);
-
-    // Extract video ID for thumbnail
-    const videoId = data.id;
-    const thumbnail = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-
-    // Build clean format list
+    const out = await runYtDlp(`--dump-json --no-playlist --no-warnings --no-check-certificates "${safe}"`);
+    const data = JSON.parse(out);
+    const id = data.id;
     const formats = [];
     const seen = new Set();
 
     if (data.formats) {
-      // Video + audio combined formats (best for users)
-      const combined = data.formats.filter(f =>
-        f.ext === 'mp4' &&
-        f.vcodec && f.vcodec !== 'none' &&
-        f.acodec && f.acodec !== 'none' &&
-        f.height
-      );
-
-      // Sort by height descending
-      combined.sort((a, b) => (b.height || 0) - (a.height || 0));
-
-      combined.forEach(f => {
-        const label = `${f.height}p`;
-        if (seen.has(label)) return;
-        seen.add(label);
-
-        formats.push({
-          format_id: f.format_id,
-          label: label,
-          ext: 'mp4',
-          type: 'video',
-          height: f.height,
-          filesize: f.filesize || f.filesize_approx || null,
-          url: f.url
+      // Best: combined mp4 with video+audio
+      data.formats
+        .filter(f => f.ext==='mp4' && f.vcodec && f.vcodec!=='none' && f.acodec && f.acodec!=='none' && f.height)
+        .sort((a,b) => (b.height||0)-(a.height||0))
+        .forEach(f => {
+          const lbl = f.height+'p';
+          if (seen.has(lbl)) return;
+          seen.add(lbl);
+          formats.push({ format_id:f.format_id, label:lbl, ext:'mp4', type:'video', height:f.height, filesize:f.filesize||f.filesize_approx||null, url:f.url });
         });
-      });
 
-      // If no combined formats found, use best video + audio merged
-      if (formats.length === 0) {
-        const videoFormats = data.formats.filter(f =>
-          f.vcodec && f.vcodec !== 'none' && f.height
-        ).sort((a, b) => (b.height || 0) - (a.height || 0));
-
-        videoFormats.slice(0, 4).forEach(f => {
-          const label = `${f.height}p`;
-          if (seen.has(label)) return;
-          seen.add(label);
-          formats.push({
-            format_id: f.format_id,
-            label: label,
-            ext: f.ext || 'mp4',
-            type: 'video',
-            height: f.height,
-            filesize: f.filesize || null,
-            url: f.url
+      // Fallback: any video format
+      if (!formats.length) {
+        data.formats
+          .filter(f => f.vcodec && f.vcodec!=='none' && f.height)
+          .sort((a,b) => (b.height||0)-(a.height||0))
+          .slice(0,4)
+          .forEach(f => {
+            const lbl = f.height+'p';
+            if (seen.has(lbl)) return;
+            seen.add(lbl);
+            formats.push({ format_id:f.format_id, label:lbl, ext:f.ext||'mp4', type:'video', height:f.height, filesize:f.filesize||null, url:f.url });
           });
-        });
       }
 
-      // Audio formats
-      const audioFormats = data.formats.filter(f =>
-        f.acodec && f.acodec !== 'none' &&
-        (!f.vcodec || f.vcodec === 'none') &&
-        (f.ext === 'm4a' || f.ext === 'webm' || f.ext === 'mp3')
-      ).sort((a, b) => (b.abr || 0) - (a.abr || 0));
-
-      if (audioFormats.length > 0) {
-        const best = audioFormats[0];
-        formats.push({
-          format_id: best.format_id,
-          label: `MP3 Audio`,
-          ext: 'mp3',
-          type: 'audio',
-          abr: best.abr || 128,
-          filesize: best.filesize || null,
-          url: best.url
-        });
+      // Audio
+      const aud = data.formats
+        .filter(f => f.acodec && f.acodec!=='none' && (!f.vcodec||f.vcodec==='none'))
+        .sort((a,b) => (b.abr||0)-(a.abr||0));
+      if (aud.length) {
+        const b = aud[0];
+        formats.push({ format_id:b.format_id, label:'MP3 Audio', ext:'mp3', type:'audio', abr:b.abr||128, filesize:b.filesize||null, url:b.url });
       }
     }
-
-    // Limit to top 5 formats
-    const topFormats = formats.slice(0, 5);
 
     return res.json({
       success: true,
       video: {
-        id: videoId,
-        title: data.title,
-        thumbnail: thumbnail,
-        duration: formatDuration(data.duration),
-        duration_seconds: data.duration,
-        channel: data.uploader || data.channel,
-        view_count: formatNumber(data.view_count),
-        upload_date: data.upload_date,
-        is_short: data.duration && data.duration <= 60,
+        id, title:data.title,
+        thumbnail:`https://img.youtube.com/vi/${id}/hqdefault.jpg`,
+        duration:fmtDur(data.duration), duration_seconds:data.duration,
+        channel:data.uploader||data.channel,
+        view_count:fmtNum(data.view_count),
+        is_short:!!(data.duration&&data.duration<=60)
       },
-      formats: topFormats
+      formats: formats.slice(0,5)
     });
 
-  } catch (err) {
-    console.error('yt-dlp error:', err.message);
-
-    // Handle specific errors
-    if (err.message.includes('Private video')) {
-      return res.status(400).json({ error: 'This video is private and cannot be downloaded.' });
-    }
-    if (err.message.includes('not available')) {
-      return res.status(400).json({ error: 'This video is not available in your region or has been removed.' });
-    }
-    if (err.message.includes('age')) {
-      return res.status(400).json({ error: 'Age-restricted videos cannot be downloaded.' });
-    }
-
-    return res.status(500).json({ error: 'Could not fetch video info. The video may be unavailable or restricted.' });
+  } catch(err) {
+    const msg = err.message||'';
+    console.error('Info error:', msg.substring(0,300));
+    if (msg.includes('Private')) return res.status(400).json({ error:'This video is private.' });
+    if (msg.includes('not available')) return res.status(400).json({ error:'Video not available in your region.' });
+    if (msg.includes('age')) return res.status(400).json({ error:'Age-restricted video.' });
+    return res.status(500).json({ error:'Could not fetch video info.', detail:msg.substring(0,300) });
   }
 });
 
-// GET /download?url=...&format_id=... — returns direct download URL
+// GET /download?url=...&format_id=...
 app.get('/download', async (req, res) => {
   const { url, format_id } = req.query;
-
-  if (!url || !format_id) {
-    return res.status(400).json({ error: 'url and format_id are required' });
-  }
-
-  const safeUrl = sanitizeUrl(url);
-  if (!safeUrl) {
-    return res.status(400).json({ error: 'Invalid URL' });
-  }
-
+  if (!url||!format_id) return res.status(400).json({ error:'url and format_id required' });
+  const safe = checkUrl(url);
+  if (!safe) return res.status(400).json({ error:'Invalid URL' });
   try {
-    // Get the direct download URL for the specific format
-    const directUrl = await runYtDlp(
-      `--format "${format_id}" --get-url --no-playlist --no-warnings "${safeUrl}"`
-    );
-
-    if (!directUrl || !directUrl.startsWith('http')) {
-      throw new Error('Could not get download URL');
-    }
-
-    return res.json({
-      success: true,
-      download_url: directUrl
-    });
-
-  } catch (err) {
-    console.error('Download URL error:', err.message);
-    return res.status(500).json({ error: 'Could not generate download link. Please try again.' });
+    const dlUrl = await runYtDlp(`--format "${format_id}" --get-url --no-playlist --no-warnings --no-check-certificates "${safe}"`);
+    if (!dlUrl||!dlUrl.startsWith('http')) throw new Error('No URL returned');
+    return res.json({ success:true, download_url:dlUrl });
+  } catch(err) {
+    return res.status(500).json({ error:'Could not get download link.', detail:err.message.substring(0,200) });
   }
 });
 
-// GET /formats — returns supported resolutions info
-app.get('/formats', (req, res) => {
-  res.json({
-    supported: ['1080p', '720p', '480p', '360p', 'MP3 Audio'],
-    note: 'Available formats depend on the original video'
-  });
-});
-
-// ── START ──
 app.listen(PORT, () => {
-  console.log(`GrabVid API running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/`);
+  console.log(`GrabVid API on port ${PORT}`);
+  console.log(`yt-dlp: ${getYtDlpPath()}`);
 });
