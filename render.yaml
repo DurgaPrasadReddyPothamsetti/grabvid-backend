@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: grabvid-api
+    env: node
+    region: singapore  # Change to: oregon, ohio, frankfurt, singapore — pick closest to your users
+    plan: free
+    buildCommand: |
+      npm install
+      curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+      chmod a+rx /usr/local/bin/yt-dlp
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: YTDLP_PATH
+        value: /usr/local/bin/yt-dlp
+    healthCheckPath: /
