@@ -29,9 +29,9 @@ function sanitizeUrl(url) {
 
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
-    // yt-dlp is installed via render.com build command
-    // Fallback paths for different environments
-    const ytdlpPath = process.env.YTDLP_PATH || 'yt-dlp';
+    // Try multiple paths — ./yt-dlp for Render, yt-dlp for local/global install
+    const ytdlpPath = process.env.YTDLP_PATH ||
+      (fs.existsSync(path.join(__dirname, 'yt-dlp')) ? path.join(__dirname, 'yt-dlp') : 'yt-dlp');
     const cmd = `${ytdlpPath} ${args}`;
 
     exec(cmd, { timeout: 30000, maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
